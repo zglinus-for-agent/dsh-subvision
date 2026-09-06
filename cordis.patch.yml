@@ -1,0 +1,8 @@
+# dsh-subvision profile layer: mounts the plugin's main row.
+# The plugin registers the `image_recognize` tool (one continuable vision
+# subagent per image, follow-ups continue the same child, even across
+# dsh-web restarts) plus the `subvision` settings namespace.
+- insert:
+    - id: subvision
+      name: dsh-subvision
+      config: {}
