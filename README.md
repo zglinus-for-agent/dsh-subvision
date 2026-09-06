@@ -114,4 +114,4 @@ cd /root/.dsh/profiles/web && pnpm add "link:/path/to/dsh-subvision"
 
 ## License
 
-[MIT](./LICENSE)
+[GPL-3.0](./LICENSE) — GNU General Public License v3.0
