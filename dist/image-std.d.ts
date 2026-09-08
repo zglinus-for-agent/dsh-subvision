@@ -5,6 +5,8 @@ export interface StandardizedImage {
     /** True when a standardized (downscaled / transcoded) copy was produced. */
     changed: boolean;
 }
+/** Probe for an installed ImageMagick binary (`magick` preferred, `convert` fallback); result cached per process. */
+export declare function findConverter(): Promise<string | undefined>;
 /**
  * Standardize an image for recognition:
  * - downscale so its longest edge is at most `longEdge` px (shrink-only,

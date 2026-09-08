@@ -15,6 +15,7 @@
 - **模型可控**: 默认识别模型可在 Plugin Settings → subvision 里设 `model`(provider/model), 或每次工具调用传 `model` 覆盖(`provider/model` 或裸模型名=沿用主管 provider); 仅在**新建**子代理时生效, 已建的保持创建时模型; 设备页可随时「重建为所选模型」。
 - **图片大小标准化(用户自定义)**: `normalize` 开关 + `normalizeLongEdge`(默认 1024px) —— 超过上限才等比缩小(仅缩不放、自动扶正、去元数据), 并把 read_image 不支持的格式(heic/avif/bmp…)转码成 PNG; 依赖本机 ImageMagick(`magick`/`convert`), 缺失或失败时自动回退原图。标准化副本按内容哈希缓存。
 - **URL 图缓存**: `image` 支持 http(s) URL, 自动下载进缓存并按哈希去重; 本地绝对路径直接读取。
+- **缩略图缓存(原图失效不丢图)**: 识别时(原图确保存在)顺手把一张小图(最长边 192px, 首帧 PNG)写进 `~/.dsh/subvision-cache/thumbnails/`, 设备页缩略图只读这个缓存副本; 原图之后被移动/删除(如临时目录被清)卡片缩略图依然显示。无 ImageMagick 时退化为把原图原样快照进缓存, 都没有才显示占位图。
 - **识图设备页(Settings → 图片代理)**: 每台代理一张缩略图卡片 + 所属会话分组; 顶部可改默认模型(Agent 预设样式浮窗, 带「视觉」标注)与标准化参数, 显示缓存占用; 每台卡片提供 主对话/子代理 跳转、识别模型下拉与「重建为所选模型」、「删除记录(顺带清理该图缓存)」; 会话头提供「清该会话缓存」。主会话被归档(workspace.json `archivedSessionIds`)时该组自动置灰并隐藏跳转/模型/重建操作。3s 自动刷新。
 
 ## 工具
@@ -58,6 +59,7 @@
 | `src/config.ts` | 配置 schema(schemastery)与 `normalizeConfig` 校验/归一 |
 | `src/image.ts` | 图片解析(本地路径/URL 下载缓存)、SHA-256、标题标记、缓存根 |
 | `src/image-std.ts` | 图片标准化: ImageMagick 缩放/转码到 `standardized/`, 失败回退原图 |
+| `src/thumb.ts` | 缩略图缓存: 识别时/按需把 192px 缩略图写入 `thumbnails/`(无转换工具则原样快照), 与原图解耦 |
 | `src/vision-registry.ts` | 哈希→childId 路由表(内存 + 落盘 `~/.dsh/subvision-state/`), 跨重启续问依据 |
 | `src/vision-devices.ts` | 设备页服务端 API: 注册表/模型目录/缓存统计/缩略图/清理/重建 |
 | `dist/` | tsc 编译产物(`main: dist/index.js`, `npm run build`) |
@@ -69,8 +71,8 @@
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/dsh-subvision/v1/devices` | 全量: 每会话代理记录(带 `exists`/`archived`)、模型/视觉模型/提供方目录(60s 缓存)、缓存占用、当前配置 |
-| GET | `/dsh-subvision/v1/thumbnail?session=&hash=` | 某代理的原图字节(缩略图用; 原图不可用返回 404) |
-| POST | `/dsh-subvision/v1/cache` | 清空全局缓存(standardized + downloads) |
+| GET | `/dsh-subvision/v1/thumbnail?session=&hash=` | 该代理的**缓存缩略图**(192px; 识别时已生成, 缺失时原图还在则即时生成, 两者都无才 404)。不再直读原图, 原图被清不影响显示 |
+| POST | `/dsh-subvision/v1/cache` | 清空全局缓存(standardized + downloads + thumbnails) |
 | POST | `/dsh-subvision/v1/cache/session` | 清空某会话下全部代理对应的缓存文件(记录保留) |
 | POST | `/dsh-subvision/v1/device/delete` | 删除某代理记录并顺带清理该图缓存(子代理会话本身保留) |
 | POST | `/dsh-subvision/v1/device/recreate` | 以指定 provider/model **重建**该图代理: 打断旧子代理 → 起新子代理 → 更新注册表 |
@@ -80,7 +82,7 @@
 ## 数据与状态文件
 
 - 路由/记录: `~/.dsh/subvision-state/<sanitized-父会话id>.json`(`{ children: [{childId, imagePath, hash, provider?, model?, createdAt, lastUsedAt}] }`, 原子写)
-- 缓存: `~/.dsh/subvision-cache/standardized/`(标准化副本 `<hash>-s<longEdge><ext>`)、`~/.dsh/subvision-cache/downloads/`(URL 下载原图 `<hash><ext>`)
+- 缓存: `~/.dsh/subvision-cache/standardized/`(标准化副本 `<hash>-s<longEdge><ext>`)、`~/.dsh/subvision-cache/downloads/`(URL 下载原图 `<hash><ext>`)、`~/.dsh/subvision-cache/thumbnails/`(设备页缩略图 `<hash>.png` 或原格式快照 `<hash><ext>`, 与原图解耦)
 - 归档判定: `~/.dsh/storages/workspace.json` 的 `global.archivedSessionIds`(10s 缓存, 不以磁盘存在性代替)
 
 以上路径均跟随 `DSH_HOME`(默认 `/root/.dsh`)。
@@ -101,7 +103,7 @@ cd /root/.dsh/profiles/web && pnpm add "link:/path/to/dsh-subvision"
 2. **续问依赖记录与 durable 会话**: 冷恢复要求注册表 json 仍在且 child 会话仍可加载; 若 `~/.dsh/subvision-state/` 被清/损坏(损坏自动忽略并从空表重建)或子代理会话被清理, 同图会**新建**子代理。
 3. **重建要求主管在线**: `device/recreate` 需 `ctx.agents.get(父会话)` 命中(409 否则), 且原图文件仍在(400 提示重新提交)。
 4. **删记录 ≠ 删子代理会话**: 为安全起见删除仅清注册表记录与图片缓存, child 会话保留仅供追溯; 需要彻底删除请到对应会话的子代理区手动处理。
-5. **缩略图读原图**: `/thumbnail` 直接读 `record.imagePath` 原始文件, 原图被移动/删除后缩略图 404(仅显示占位)。
+5. **缩略图与原图解耦(其余功能仍依赖原图)**: `/thumbnail` 只读 `subvision-cache/thumbnails/` 缓存副本(识别时生成, 缺失时原图还在则即时补), 原图被移动/删除后设备页缩略图仍显示; 但 `image_recognize` 续问、`device/recreate` 依然需要原图或 `standardized/`/`downloads/` 副本仍在(身份与识别以字节为准)。
 6. **归档灰显语义**: 以 `workspace.json global.archivedSessionIds` 为准(10s 缓存), 归档组置灰并隐藏跳转/识别模型/重建, 仅保留记录删除与该会话缓存清理。
 7. **无多用户鉴权**: API 仅做同源(Origin)校验, 不带用户权限; 适合单用户自托管场景。
 8. **标准化是尽力而为**: 依赖本机 ImageMagick, 生成失败/超时(60s)/工具缺失都回退原图; 转码只为 read_image 可读性, 不改变原始语义。

@@ -10,7 +10,7 @@ DSH(DeepSeek Harness)web 插件: **一张图片 = 一台可追问的 vision 识�
 - 客户端插件(`client.js`, 手写 ModuleLoader bundle, 无构建): Settings → 「图片代理」独立页(`settings.section` id `subvision-devices`)。
 - 默认数据文件(跟随 `DSH_HOME=/root/.dsh`):
   - 注册表(哈希→childId): `/root/.dsh/subvision-state/<父会话id(非法字符→_)>.json`, schema `{children:[{childId,imagePath,hash,provider?,model?,createdAt,lastUsedAt}]}`
-  - 缓存: `/root/.dsh/subvision-cache/standardized/`(`<hash>-s<longEdge><ext>`)、`/root/.dsh/subvision-cache/downloads/`(`<hash><ext>`)
+  - 缓存: `/root/.dsh/subvision-cache/standardized/`(`<hash>-s<longEdge><ext>`)、`/root/.dsh/subvision-cache/downloads/`(`<hash><ext>`)、`/root/.dsh/subvision-cache/thumbnails/`(缩略图 `<hash>.png` 或原格式快照 `<hash><ext>`)
   - 归档清单: `/root/.dsh/storages/workspace.json` → `global.archivedSessionIds`
   - 会话文件: `/root/.dsh/sessions/<workspace>/<sessionId>/session.jsonl.zstd`
 
@@ -24,6 +24,11 @@ DSH(DeepSeek Harness)web 插件: **一张图片 = 一台可追问的 vision 识�
 
 ### src/image-std.ts
 - `standardizeImage(resolved, longEdge, enabled)` — 开 `normalize` 且存在 `magick`/`convert` 时: 生成 `standardized/<hash>-s<longEdge><ext|.png>`, 参数 `原图 -auto-orient -strip -resize <L>x<L>> 输出`(仅缩不放)。readable 扩展名 png/jpg/jpeg/webp/gif 保留, 其余(heic/avif/bmp)→ PNG 转码。缓存命中直接复用。**任何失败回退原图**(`changed:false`)。
+- `findConverter()` 已导出(进程内缓存探测 magick/convert), 供 `thumb.ts` 复用。
+
+### src/thumb.ts(缩略图缓存, 与原图解耦)
+- `ensureThumbnail(hash, {originalPath, fallbackPaths?})` — 目标: 设备页缩略图不再依赖原图存活。策略(首个命中即返回): ① `thumbnails/` 已有该 hash 的缓存文件(任意名字)直接复用; ② 有 magick/convert 且任一源可读: `源[0] -auto-orient -strip -resize 192x192> thumbnails/<hash>.png`(取首帧, 仅缩不放, 20s 超时); ③ 否则把第一个浏览器可读(png/jpg/jpeg/webp/gif)的源**原样快照**到 `thumbnails/<hash><ext>`; ④ 都不行返回 `null`(UI 显示占位)。正常 IO/图像错误不抛异常, 逐级降级。
+- 关键调用点: `index.ts` 工具流(识别时原图必在, **热生成**)、`vision-devices.ts` 的 `/thumbnail`(缺失时原图还在则**冷补**, 没有缓存且原图已消失才 404)、`device/recreate`(顺带补齐)。
 
 ### src/vision-registry.ts
 - `VisionRegistry(parentSessionId)`: 每父会话一张表, 文件 `<stateDir>/<sanitize(parentSessionId)>.json`; `find(hash)/remember(record)/forget(hash)/all()`; 落盘先写 `.tmp` 再 rename(失败直接写)。损坏文件 warn 后忽略。`VisionRegistry.allSessions()` 静态扫全目录(忽略 `.tmp`), 按首个 createdAt 升序。
@@ -31,7 +36,7 @@ DSH(DeepSeek Harness)web 插件: **一张图片 = 一台可追问的 vision 识�
 
 ### src/index.ts(服务端插件入口)
 - `inject = ["tools","subagents","agents","llm","webServer"]`。`apply` 做: 装 settings 命名空间(`subvision`, 经 `installSettingsSection`), 装设备 API, 注册 `image_recognize`。
-- 工具执行流程: `resolveImage` → `standardizeImage` → 查注册表(命中→`ctx.subagents.followup` 冷恢复续问; 未命中→`ctx.subagents.startContinuable` 新建, `agentOptions` = provider/model/maxTokens) → `remember`。
+- 工具执行流程: `resolveImage` → `standardizeImage` → `ensureThumbnail`(趁原图必在, 热生成缩略图缓存; 失败不阻断) → 查注册表(命中→`ctx.subagents.followup` 冷恢复续问; 未命中→`ctx.subagents.startContinuable` 新建, `agentOptions` = provider/model/maxTokens) → `remember`。
 - 标题恒为 `识图 | <路径> | <哈希前16>`, prompt 内附路径/哈希/标准化说明(标准化时注明缩放比例换算)。
 - **同 (父会话,哈希) 并发**: `createLocks` 进程内 promise 队列, 防双建。
 - model 覆盖解析 `parseModelOverride`: 含 `/` → provider/model; 裸名 → 沿用 parent provider; 空 → 无覆盖。
@@ -40,8 +45,9 @@ DSH(DeepSeek Harness)web 插件: **一张图片 = 一台可追问的 vision 识�
 - 端点与行为见 README「API」表。要点:
   - 模型目录: `ctx.llm.listProviders → listModels → resolveModelInfo`; 每 provider 缓存 60s; 每模型 resolve 4s 超时、整 provider 10s 超时; `ctx.llm` 可能不可用(用 try/catch 包), 目录为空则 UI 只剩默认/跟随。
   - `archived` 以 `workspace.json global.archivedSessionIds` 为准(10s 缓存); `exists` 是跨 workspace 扫 `session.jsonl.zstd`。**不要用磁盘存在性代替归档判定**。
-  - 缩略图直接读 `record.imagePath` 原文件。
-  - `device/recreate`: 需父会话在线(`ctx.agents.get`), 先 `ctx.subagents.interrupt` 旧 child, 再 `startContinuable` 新 child 并 `remember`。**注意 `interrupt` 缺失场景为 no-op**。
+  - 缩略图: 经 `ensureThumbnail` 走 `thumbnails/` 缓存(识别时热生成; 端点缺失且原图还在则冷补); **不再直读 `record.imagePath`**。找不到缓存且原图已消失 → 404(仅占位图)。
+  - `device/recreate`: 需父会话在线(`ctx.agents.get`), 先 `ctx.subagents.interrupt` 旧 child, 再 `startContinuable` 新 child 并 `remember`; 顺带补齐缩略图缓存。**注意 `interrupt` 缺失场景为 no-op**。
+  - `removeHashFiles`/`cacheStats`/全局清缓存都覆盖 `thumbnails/` 目录, 别漏。
 - 服务端改动必须**重启 DSH** 生效(ESM 模块缓存), 用 `restart_harness` 工具(见 §4)。
 
 ### client.js(浏览器端, settings.section 页面)

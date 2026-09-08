@@ -5,6 +5,7 @@ import * as os from "node:os";
 import { VisionRegistry } from "./vision-registry.js";
 import { cacheRoot, hashMarker } from "./image.js";
 import { standardizeImage } from "./image-std.js";
+import { ensureThumbnail } from "./thumb.js";
 const BASE = "/dsh-subvision/v1";
 function json(res, code, body) {
     res.writeHead(code, { "content-type": "application/json; charset=utf-8", "cache-control": "no-cache" });
@@ -140,12 +141,13 @@ export function installDevicesApi(ctx, deps) {
         await walk(dir);
         return count;
     };
-    /** Cache usage summary for the page: standardized copies + downloaded originals. */
+    /** Cache usage summary for the page: standardized copies + downloaded originals + thumbnails. */
     const cacheStats = async () => {
         const root = cacheRoot();
         return {
             standardizedBytes: await dirBytes(path.join(root, "standardized")),
             downloadBytes: await dirBytes(path.join(root, "downloads")),
+            thumbnailBytes: await dirBytes(path.join(root, "thumbnails")),
             files: await countFiles(root),
         };
     };
@@ -188,11 +190,11 @@ export function installDevicesApi(ctx, deps) {
         }
         return archivedIds;
     };
-    /** 删除某个图片哈希在标准化/下载缓存里的全部文件。 */
+    /** 删除某个图片哈希在标准化/下载/缩略图缓存里的全部文件。 */
     const removeHashFiles = async (hash) => {
         let removed = 0;
         const root = cacheRoot();
-        for (const dir of ["standardized", "downloads"]) {
+        for (const dir of ["standardized", "downloads", "thumbnails"]) {
             const full = path.join(root, dir);
             const names = await fs.readdir(full).catch(() => []);
             for (const name of names) {
@@ -256,9 +258,21 @@ export function installDevicesApi(ctx, deps) {
                 const record = await new VisionRegistry(session).find(hash);
                 if (record === undefined)
                     return json(res, 404, { ok: false, error: "unknown device" });
-                const bytes = await fs.readFile(record.imagePath).catch(() => null);
+                // Serve the plugin-cached thumbnail (generated eagerly at recognition
+                // time, or lazily here while the original still exists) instead of the
+                // original file, so the card keeps its picture after the original is
+                // deleted/moved. Returns 404 only when no cache exists and the
+                // original is gone too.
+                const cfg = deps.currentConfig();
+                const thumb = await ensureThumbnail(record.hash, {
+                    originalPath: record.imagePath,
+                    fallbackPaths: [stdCachePath(record, cfg.normalizeLongEdge)],
+                });
+                if (thumb === null)
+                    return json(res, 404, { ok: false, error: "thumbnail unavailable: no cached copy and original image file is gone" });
+                const bytes = await fs.readFile(thumb).catch(() => null);
                 if (bytes === null)
-                    return json(res, 404, { ok: false, error: "image file unavailable" });
+                    return json(res, 404, { ok: false, error: "thumbnail file unreadable" });
                 const mime = {
                     ".png": "image/png",
                     ".jpg": "image/jpeg",
@@ -267,7 +281,7 @@ export function installDevicesApi(ctx, deps) {
                     ".gif": "image/gif",
                 };
                 res.writeHead(200, {
-                    "content-type": mime[path.extname(record.imagePath).toLowerCase()] ?? "application/octet-stream",
+                    "content-type": mime[path.extname(thumb).toLowerCase()] ?? "application/octet-stream",
                     "cache-control": "public, max-age=86400, immutable",
                 });
                 res.end(bytes);
@@ -276,7 +290,7 @@ export function installDevicesApi(ctx, deps) {
             if (p === `${BASE}/cache` && method === "POST") {
                 const root = cacheRoot();
                 const removed = await countFiles(root);
-                for (const dir of ["standardized", "downloads"]) {
+                for (const dir of ["standardized", "downloads", "thumbnails"]) {
                     await fs.rm(path.join(root, dir), { recursive: true, force: true }).catch(() => undefined);
                     await fs.mkdir(path.join(root, dir), { recursive: true }).catch(() => undefined);
                 }
@@ -327,6 +341,8 @@ export function installDevicesApi(ctx, deps) {
                 const exists = await fs.stat(record.imagePath).then((s) => s.isFile(), () => false);
                 if (!exists)
                     return json(res, 400, { ok: false, error: `原图已不可用：${record.imagePath}（请重新通过 image_recognize 提交）` });
+                // Opportunistically ensure the cached thumbnail while the original is available.
+                await ensureThumbnail(record.hash, { originalPath: record.imagePath }).catch(() => undefined);
                 const cfg = deps.currentConfig();
                 const bodyProvider = (body.provider ?? "").trim();
                 const bodyModel = (body.model ?? "").trim();

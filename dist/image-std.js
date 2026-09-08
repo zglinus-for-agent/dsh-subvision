@@ -7,7 +7,8 @@ const execFileAsync = promisify(execFile);
 /** Formats the base read_image tool can hand straight to the model. */
 const READABLE_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
 let toolCache;
-async function findConverter() {
+/** Probe for an installed ImageMagick binary (`magick` preferred, `convert` fallback); result cached per process. */
+export async function findConverter() {
     if (toolCache !== undefined)
         return toolCache === "" ? undefined : toolCache;
     for (const tool of ["magick", "convert"]) {

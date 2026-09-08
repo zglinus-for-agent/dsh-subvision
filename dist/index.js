@@ -4,6 +4,7 @@ import { installSettingsSection, settingsNamespace } from "@deepseek-ai/dsh-sett
 import { Config, normalizeConfig } from "./config.js";
 import { resolveImage, hashMarker } from "./image.js";
 import { standardizeImage } from "./image-std.js";
+import { ensureThumbnail } from "./thumb.js";
 import { VisionRegistry } from "./vision-registry.js";
 import { installDevicesApi } from "./vision-devices.js";
 export { Config, normalizeConfig } from "./config.js";
@@ -124,6 +125,13 @@ export function apply(ctx, config) {
             // User-customizable size standardization: downscale (and, when needed,
             // transcode) oversized/exotic images before the vision subagent reads them.
             const standardized = await standardizeImage(resolved, cfg.normalizeLongEdge, cfg.normalize);
+            // Eagerly cache a small display thumbnail while the original file is
+            // guaranteed to exist, so the devices page keeps showing it after the
+            // original is deleted/moved (may also lazily regenerate on demand).
+            await ensureThumbnail(resolved.hash, {
+                originalPath: resolved.path,
+                fallbackPaths: standardized.changed ? [standardized.path] : [],
+            }).catch(() => undefined);
             const readPath = standardized.path;
             const marker = hashMarker(resolved.hash);
             const parentSessionId = String(parent.id);

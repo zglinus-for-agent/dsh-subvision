@@ -17,7 +17,8 @@ export interface StandardizedImage {
 }
 
 let toolCache: string | undefined;
-async function findConverter(): Promise<string | undefined> {
+/** Probe for an installed ImageMagick binary (`magick` preferred, `convert` fallback); result cached per process. */
+export async function findConverter(): Promise<string | undefined> {
   if (toolCache !== undefined) return toolCache === "" ? undefined : toolCache;
   for (const tool of ["magick", "convert"]) {
     try {

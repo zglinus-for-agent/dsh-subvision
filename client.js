@@ -239,7 +239,7 @@ window.__ModuleLoader__.load({
 
       function clearCache() {
         if (cacheBusy) return;
-        if (!window.confirm("确定清空图片代理缓存（标准化副本 + 下载原图）？清空后仅磁盘占用归零，不影响代理记录。")) return;
+        if (!window.confirm("确定清空图片代理缓存（标准化副本 + 下载原图 + 缩略图）？清空后仅磁盘占用归零，不影响代理记录；缩略图在原图还在时会被重新生成。")) return;
         setCacheBusy(true);
         fetch(API + "/cache", { method: "POST" })
           .then(function (r) { return r.json(); })
@@ -417,13 +417,14 @@ window.__ModuleLoader__.load({
           onPick: onDefaultModelChange,
         })),
         settingsRow("图片标准化", "用户自定义：超过上限边长的图片在识别前等比缩小", stdControl),
-        settingsRow("缓存占用", "标准化副本与下载原图的磁盘占用（重启不丢失）", h("div", null,
+        settingsRow("缓存占用", "标准化副本/下载原图/缩略图的磁盘占用（重启不丢失）", h("div", null,
           h("div", { style: { ...monoStyle, color: SECONDARY, display: "grid", gridTemplateColumns: "auto 1fr", gap: "2px 14px" } },
             data && data.cache
               ? [
                   h("span", { key: "a" }, "标准化"), h("span", { key: "b" }, fmtBytes(data.cache.standardizedBytes)),
+                  h("span", { key: "t" }, "缩略图"), h("span", { key: "u" }, fmtBytes(data.cache.thumbnailBytes)),
                   h("span", { key: "c" }, "下载"), h("span", { key: "d" }, fmtBytes(data.cache.downloadBytes)),
-                  h("span", { key: "e" }, "合计"), h("span", { key: "f" }, fmtBytes((data.cache.standardizedBytes || 0) + (data.cache.downloadBytes || 0))),
+                  h("span", { key: "e" }, "合计"), h("span", { key: "f" }, fmtBytes((data.cache.standardizedBytes || 0) + (data.cache.downloadBytes || 0) + (data.cache.thumbnailBytes || 0))),
                   h("span", { key: "g" }, "文件数"), h("span", { key: "h" }, String(data.cache.files || 0)),
                   h("span", { key: "i" }, "位置"), h("span", { key: "j" }, "~/.dsh/subvision-cache/"),
                 ]
