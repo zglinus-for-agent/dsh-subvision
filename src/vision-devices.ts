@@ -13,6 +13,15 @@ import { VisionRegistry, type VisionChildRecord } from "./vision-registry.js";
 import { cacheRoot, hashMarker, type ResolvedImage } from "./image.js";
 import { standardizeImage } from "./image-std.js";
 import { ensureThumbnail } from "./thumb.js";
+import {
+  CATALOG_TTL_MS,
+  firstVisionModel,
+  llmOf,
+  loadProviderCatalog,
+  type ModelCatalog,
+  type ProviderCatalogEntry,
+} from "./vision-models.js";
+import { childDelegationFilter } from "./child-tools.js";
 
 const BASE = "/dsh-subvision/v1";
 
@@ -74,38 +83,14 @@ export function installDevicesApi(ctx: Context & DeviceApiCtx, deps: DeviceApiDe
     ctx.logger?.warn?.("[dsh-subvision] webServer unavailable; device API not mounted");
     return;
   }
-  // Provider/model catalog (same source the GUI model picker uses:
-  // ctx.llm.listProviders → listModels → resolveModelInfo). Cached 60s so the
-  // page's 3s polling never pounds adapters (esp. remote catalogs like opencode).
-  interface ProviderCatalog { models: string[]; vision: string[]; loadedAt: number; }
-  const providerCatalog = new Map<string, ProviderCatalog>();
-  const CATALOG_TTL_MS = 60_000;
+  // Provider/model catalog (shared with the "auto" resolution in index.ts via
+  // vision-models.ts: ctx.llm.listProviders → listModels → resolveModelInfo).
+  // Cached 60s so the page's 3s polling never pounds adapters (esp. remote
+  // catalogs like opencode).
+  const providerCatalog = new Map<string, ProviderCatalogEntry>();
 
-  const withTimeout = <T>(promise: Promise<T>, ms: number): Promise<T | null> =>
-    Promise.race([
-      promise,
-      new Promise<null>((resolve) => { setTimeout(() => resolve(null), ms).unref?.(); }),
-    ]);
-
-  const buildCatalog = async (): Promise<{
-    models: Record<string, string[]>;
-    vision: Record<string, string[]>;
-    providers: Array<{ id: string; name: string }>;
-  }> => {
-    let llm: {
-      listProviders(): Array<{ id: string; name: string }>;
-      listModels(p: string): Promise<readonly { id?: string; name?: string; model?: string }[]>;
-      resolveModelInfo(p: string, m: string, signal?: AbortSignal): Promise<{ inputModalities?: readonly string[] }>;
-    } | undefined;
-    try {
-      llm = (ctx as unknown as { llm?: {
-        listProviders(): Array<{ id: string; name: string }>;
-        listModels(p: string): Promise<readonly { id?: string; name?: string; model?: string }[]>;
-        resolveModelInfo(p: string, m: string, signal?: AbortSignal): Promise<{ inputModalities?: readonly string[] }>;
-      } }).llm;
-    } catch {
-      llm = undefined;
-    }
+  const buildCatalog = async (): Promise<ModelCatalog> => {
+    const llm = llmOf(ctx);
     if (llm === undefined) return { models: {}, vision: {}, providers: [] };
 
     const cfg = deps.currentConfig();
@@ -114,29 +99,12 @@ export function installDevicesApi(ctx: Context & DeviceApiCtx, deps: DeviceApiDe
     if (cfg.model?.provider) wanted.set(cfg.model.provider, cfg.model.provider);
     if (!wanted.has("deepseek-official")) wanted.set("deepseek-official", "deepseek-official");
 
-    const now = Date.now();
     const models: Record<string, string[]> = {};
     const vision: Record<string, string[]> = {};
     const providers: Array<{ id: string; name: string }> = [];
 
     for (const [id, name] of wanted) {
-      let entry = providerCatalog.get(id);
-      if (entry === undefined || now - entry.loadedAt > CATALOG_TTL_MS) {
-        const infos = (await withTimeout(llm.listModels(id), 10_000)) ?? [];
-        const names = infos.map((info) => info.id ?? info.model ?? "").filter(Boolean);
-        const visionNames: string[] = [];
-        for (const modelName of names) {
-          const resolved = await withTimeout(
-            llm.resolveModelInfo(id, modelName, new AbortController().signal),
-            4_000,
-          );
-          if (resolved?.inputModalities !== undefined && resolved.inputModalities.includes("image")) {
-            visionNames.push(modelName);
-          }
-        }
-        entry = { models: names, vision: visionNames, loadedAt: Date.now() };
-        providerCatalog.set(id, entry);
-      }
+      const entry = await loadProviderCatalog(llm, id, providerCatalog, CATALOG_TTL_MS);
       if (entry.models.length > 0) {
         models[id] = [...entry.models];
         if (entry.vision.length > 0) vision[id] = [...entry.vision];
@@ -285,10 +253,14 @@ export function installDevicesApi(ctx: Context & DeviceApiCtx, deps: DeviceApiDe
           });
         }
         const catalog = await buildCatalog();
+        // What "auto" currently resolves to (first image-capable model), so the
+        // page can show it instead of the old "跟随主管" wording.
+        const autoModel = await firstVisionModel(ctx, providerCatalog, CATALOG_TTL_MS);
         const cache = await cacheStats();
         return json(res, 200, {
           ok: true,
           defaultModel: cfg.model ?? null,
+          autoModel: autoModel ?? null,
           normalize: cfg.normalize,
           normalizeLongEdge: cfg.normalizeLongEdge,
           models: catalog.models,
@@ -385,9 +357,28 @@ export function installDevicesApi(ctx: Context & DeviceApiCtx, deps: DeviceApiDe
         const cfg = deps.currentConfig();
         const bodyProvider = (body.provider ?? "").trim();
         const bodyModel = (body.model ?? "").trim();
-        const provider = bodyProvider !== "" ? bodyProvider : (cfg.model?.provider ?? "deepseek-official");
-        const model = bodyModel !== "" ? bodyModel : (cfg.model?.model ?? "");
-        if (model.length === 0) return json(res, 400, { ok: false, error: "model required (provider/model 或 bare model)" });
+        // Empty provider/model means "auto": the configured default model when
+        // set, otherwise the first vision-capable model in the catalog (never a
+        // text-only supervisor model, which would refuse the image).
+        let provider = bodyProvider;
+        let model = bodyModel;
+        if (provider === "" || model === "") {
+          const fixed = cfg.model;
+          const auto = fixed !== undefined && fixed.provider !== "" && fixed.model !== ""
+            ? { provider: fixed.provider, model: fixed.model }
+            : await firstVisionModel(ctx, providerCatalog, CATALOG_TTL_MS);
+          if (auto !== undefined) {
+            if (provider === "") provider = auto.provider;
+            if (model === "") model = auto.model;
+          }
+        }
+        if (provider === "") provider = "deepseek-official";
+        if (model === "") {
+          return json(res, 400, {
+            ok: false,
+            error: "无法自动选择视觉模型（llm 目录不可用，或没有任何模型声明 image 模态）：请显式指定 provider/model",
+          });
+        }
 
         // Reuse the standardized cache when present (or generate it again).
         let readPath = record.imagePath;
@@ -414,16 +405,32 @@ export function installDevicesApi(ctx: Context & DeviceApiCtx, deps: DeviceApiDe
         // Interrupt a live old child (user authority); an absent target is a no-op.
         ctx.subagents.interrupt(SessionId(oldChildId), { kind: "user", parentSessionId: SessionId(session) });
 
-        const start = await ctx.subagents.startContinuable({
+        // Same nesting guard as the tool path: a rebuilt recognition child never
+        // receives the delegation tools (it must not spawn further subagents).
+        const toolFilter = childDelegationFilter(ctx, cfg.denyChildTools);
+        const spec = {
           provider: cfg.provider,
           label: title,
           request: {
-            prompt: [{ type: "text", text: seedText }],
+            prompt: [{ type: "text" as const, text: seedText }],
             parent,
             agentOptions: { provider, model },
+            ...(toolFilter === undefined ? {} : { toolFilter }),
           },
           signal: new AbortController().signal,
-        });
+        };
+        let start: Awaited<ReturnType<typeof ctx.subagents.startContinuable>>;
+        try {
+          start = await ctx.subagents.startContinuable(spec as Parameters<typeof ctx.subagents.startContinuable>[0]);
+        } catch (error) {
+          if (toolFilter === undefined) throw error;
+          ctx.logger?.warn?.(
+            "[dsh-subvision] child tool filter rejected on rebuild (%s); rebuilding without the nested-delegation guard",
+            String((error as Error)?.message ?? error),
+          );
+          delete (spec.request as { toolFilter?: unknown }).toolFilter;
+          start = await ctx.subagents.startContinuable(spec as Parameters<typeof ctx.subagents.startContinuable>[0]);
+        }
         const newChildId = String(start.childId);
         await registry.remember({
           childId: newChildId,

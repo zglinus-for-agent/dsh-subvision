@@ -213,6 +213,11 @@ window.__ModuleLoader__.load({
       var defaultModel = data && data.defaultModel
         ? (data.defaultModel.provider || "") + "/" + (data.defaultModel.model || "")
         : "";
+      // 服务端 "auto" 当前解析到的模型（目录里第一个声明 image 模态的模型）
+      var autoModel = data && data.autoModel
+        ? (data.autoModel.provider || "") + "/" + (data.autoModel.model || "")
+        : "";
+      var autoLabel = "自动（" + (autoModel || "首个可用视觉模型") + "）";
       var totalDevices = 0;
       if (data && data.sessions) {
         data.sessions.forEach(function (g) { totalDevices += (g.children || []).length; });
@@ -223,18 +228,22 @@ window.__ModuleLoader__.load({
 
       function flash(msg, ok) { setNotice({ ok: Boolean(ok), msg: msg, key: Date.now() }); }
 
-      function mutateSettings(ops, onDone) {
-        api.settings.mutate({ ns: SETTINGS_NS, ops: ops })
-          .then(function (response) {
-            if (!response.result.ok) {
-              var detail = response.result.error || {};
-              flash("保存失败: " + String(detail.message || detail.code || "unknown"), false);
-              return;
-            }
+      // dsh 0.1.5: settings writes go through the bound settings scope
+      // (ctx.settingsScope.bind({namespace}) → set/unset/mutate). The legacy
+      // `ctx.connection.api.settings.mutate({ns, ops})` bag no longer exists:
+      // calling it threw synchronously, so neither onDone nor the flash ran and
+      // the picker stayed disabled ("无法选择模型").
+      function mutateSettings(ops, onDone, onFail) {
+        Promise.resolve()
+          .then(function () { return scope.mutate(ops); })
+          .then(function () {
             if (onDone) onDone();
             refresh();
           })
-          .catch(function (e) { flash("保存失败: " + String((e && e.message) || e), false); });
+          .catch(function (e) {
+            if (onFail) onFail();
+            flash("保存失败: " + String((e && e.message) || e), false);
+          });
       }
 
       function clearCache() {
@@ -295,8 +304,9 @@ window.__ModuleLoader__.load({
             : [{ op: "unset", path: ["model"] }],
           function () {
             setDefaultBusy(false);
-            flash(value ? ("默认模型已设为 " + value) : "已清除默认模型（新建代理跟随主管）", true);
-          });
+            flash(value ? ("默认模型已设为 " + value) : ("已恢复自动（将采用 " + (autoModel || "第一个可用视觉模型") + "）"), true);
+          },
+          function () { setDefaultBusy(false); });
       }
 
       function setNormalize(nextOn, nextEdge) {
@@ -309,7 +319,7 @@ window.__ModuleLoader__.load({
           flash(nextOn
             ? ("图片标准化已开启：最长边上限 " + (nextEdge ?? normEdge) + "px")
             : "图片标准化已关闭（原图直接识别）", true);
-        });
+        }, function () { setNormBusy({ busy: false }); });
       }
 
       function onEdgeInputBlur(ev) {
@@ -407,11 +417,11 @@ window.__ModuleLoader__.load({
         titleBlock("图片代理",
           totalDevices > 0 ? h("span", { style: { color: SECONDARY, fontSize: 12.5 } }, "共 " + totalDevices + " 台") : null,
           "每张图片一台可追问的识别子代理；设置与状态每 3 秒自动刷新"),
-        settingsRow("默认模型", "新建代理采用的识别模型（带「视觉」标注的模型可直接读图）", h(ModelPicker, {
-          key: "def-" + (defaultModel || "_none"),
+        settingsRow("默认模型", "新建代理采用的识别模型；「自动」= 取目录里第一个支持读图的模型（带「视觉」标注）", h(ModelPicker, {
+          key: "def-" + (defaultModel || "_auto") + "-" + autoModel,
           value: defaultModel,
           options: modelOptions,
-          emptyLabel: defaultModel ? "跟随主管（清除当前默认）" : "跟随主管",
+          emptyLabel: defaultModel ? ("自动（清除默认 → " + (autoModel || "首个视觉模型") + "）") : autoLabel,
           allowEmpty: true,
           disabled: defaultBusy,
           onPick: onDefaultModelChange,
@@ -462,8 +472,8 @@ window.__ModuleLoader__.load({
           );
           (group.children || []).forEach(function (rec) {
             var current = (rec.provider || "") + "/" + (rec.model || "");
-            var picked = chosenRef.current[rec.hash] || current;
-            var emptyLabel = "跟随默认（" + (defaultModel || "未设 → 主管模型") + "）";
+            var picked = Object.prototype.hasOwnProperty.call(chosenRef.current, rec.hash) ? chosenRef.current[rec.hash] : current;
+            var emptyLabel = "自动（" + (defaultModel || autoModel || "首个可用视觉模型") + "）";
             agentBlocks.push(
               h("div", { key: rec.hash, style: { border: "1px solid " + (mainKnown ? "rgba(128,132,148,.42)" : "rgba(128,132,148,.22)"), borderRadius: 10, padding: "8px 14px 6px", marginBottom: 12, opacity: mainKnown ? 1 : 0.55 } },
                 h("div", { style: { display: "flex", alignItems: "center", gap: 10 } },
@@ -492,22 +502,25 @@ window.__ModuleLoader__.load({
                     setTick(tick + 1);
                   },
                 })) : null,
-                mainKnown ? settingsRow("重建", "旧代理停用，后续追问由新代理接管", h("button", { type: "button", disabled: busy.hash === rec.hash, onClick: function () {
-                  var chosen = chosenRef.current[rec.hash] || defaultModel;
-                  if (!chosen) { flash("请先为这台代理选择模型，或设置顶部默认模型", false); return; }
-                  var slash = chosen.indexOf("/");
-                  var provider = slash > 0 ? chosen.slice(0, slash) : "deepseek-official";
-                  var model = slash > 0 ? chosen.slice(slash + 1) : chosen;
+                mainKnown ? settingsRow("重建", "旧代理停用，后续追问由新代理接管；模型选「自动」则由服务端挑第一个可用视觉模型", h("button", { type: "button", disabled: busy.hash === rec.hash, onClick: function () {
+                  var chosen = Object.prototype.hasOwnProperty.call(chosenRef.current, rec.hash) ? chosenRef.current[rec.hash] : defaultModel;
+                  var body = { session: sessionId, hash: rec.hash };
+                  if (chosen) {
+                    var slash = chosen.indexOf("/");
+                    body.provider = slash > 0 ? chosen.slice(0, slash) : "deepseek-official";
+                    body.model = slash > 0 ? chosen.slice(slash + 1) : chosen;
+                  }
                   setBusy({ hash: rec.hash });
                   fetch(API + "/device/recreate", {
                     method: "POST",
                     headers: { "content-type": "application/json" },
-                    body: JSON.stringify({ session: sessionId, hash: rec.hash, provider: provider, model: model }),
+                    body: JSON.stringify(body),
                   })
                     .then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j }; }); })
                     .then(function (res) {
                       if (res.json.ok) {
-                        flash("已用 " + chosen + " 重建该图片代理 → " + res.json.newChildId, true);
+                        var used = chosen || ("自动 " + ((res.json.provider || "") + "/" + (res.json.model || ""))); 
+                        flash("已用 " + used + " 重建该图片代理 → " + res.json.newChildId, true);
                       } else {
                         flash(String(res.json.error || ("HTTP " + res.status)), false);
                       }

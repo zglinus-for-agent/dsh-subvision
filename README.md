@@ -10,9 +10,10 @@
 
 ## 特性
 
-- **一图一代理**: 图片身份 = 文件内容 **SHA-256**(前 16 hex 作为标题标记)。第一次识别时经 `ctx.subagents.startContinuable` 创建专属子代理; 之后同图追问走 `ctx.subagents.followup`, 全程是同一个 child session, 记忆连续。
+- **一图一代理**: 图片身份 = 文件内容 **SHA-256**(前 16 hex 作为标题标记)。第一次识别时经 `ctx.subagents.startContinuable` 创建专属子代理; 之后同图追问走 `ctx.subagents.sendMessage`(dsh 0.1.5 起取代旧 `followup`), 全程是同一个 child session, 记忆连续。
 - **重启可续问**: 哈希 → childId 路由持久化在 `~/.dsh/subvision-state/<父会话id>.json`, 进程重启后 `image_recognize` 命中记录即冷恢复原子代理; 子代理标题恒为 `识图 | <图片路径> | <哈希前16位>`(哈希放末尾作持久标记)。
-- **模型可控**: 默认识别模型可在 Plugin Settings → subvision 里设 `model`(provider/model), 或每次工具调用传 `model` 覆盖(`provider/model` 或裸模型名=沿用主管 provider); 仅在**新建**子代理时生效, 已建的保持创建时模型; 设备页可随时「重建为所选模型」。
+- **不嵌套委派**: 识图子代理创建时经 `SubagentStartRequest.toolFilter` 摘掉委派类工具(`subagent`/`subagent_fork`/`workflow`/`ralph`/`image_recognize` 及子代理控制类), 它既不能再起子代理、也不能递归识图 —— 识别永远是**单层**委派, 不会在触发它的会话里套娃。名单可用 `denyChildTools` 配置, 本部署未注册的工具名自动跳过(避免 `tools.restrict()` 未知名报错)。
+- **模型自动选择**: 未设 `model` 时按**自动**解析 —— 取 LLM 目录里第一个声明 `inputModalities` 含 `image` 的模型(本部署为 `deepseek-official/deepseek-flash`), 因此识图子代理绝不会继承纯文本的主管模型(主管 `deepseek-v4-flash` 读不了图); 只有目录里没有任何视觉模型时才回落到主管模型。也可显式设 `model`, 或每次调用传 `model` 覆盖(`provider/model` 或裸模型名=沿用主管 provider); 仅在**新建**子代理时生效, 已建的保持创建时模型; 设备页可随时「重建为所选模型」。
 - **图片大小标准化(用户自定义)**: `normalize` 开关 + `normalizeLongEdge`(默认 1024px) —— 超过上限才等比缩小(仅缩不放、自动扶正、去元数据), 并把 read_image 不支持的格式(heic/avif/bmp…)转码成 PNG; 依赖本机 ImageMagick(`magick`/`convert`), 缺失或失败时自动回退原图。标准化副本按内容哈希缓存。
 - **URL 图缓存**: `image` 支持 http(s) URL, 自动下载进缓存并按哈希去重; 本地绝对路径直接读取。
 - **缩略图缓存(原图失效不丢图)**: 识别时(原图确保存在)顺手把一张小图(最长边 192px, 首帧 PNG)写进 `~/.dsh/subvision-cache/thumbnails/`, 设备页缩略图只读这个缓存副本; 原图之后被移动/删除(如临时目录被清)卡片缩略图依然显示。无 ImageMagick 时退化为把原图原样快照进缓存, 都没有才显示占位图。
@@ -43,8 +44,9 @@
 |---|---|---|
 | `provider` | `spawn` | 子代理后端(spawn provider = 全新子 Agent) |
 | `toolName` | `image_recognize` | 注册给模型的工具名 |
-| `model` | 空 | 默认识别模型 `{provider, model}`; 留空跟随主管会话当前模型 |
+| `model` | 空(自动) | 默认识别模型 `{provider, model}`; **留空=自动**: 取目录里第一个声明 `image` 模态的模型, 目录无视觉模型时才回落主管模型 |
 | `maxTokens` | 空 | 子代理 token 上限 |
+| `denyChildTools` | 见 §特性 | 从识图子代理里移除的工具名(默认 `subagent`/`subagent_fork`/`workflow`/`ralph`/`image_recognize`/`list_agents`/`send_message`/`interrupt_agent`); 本部署未注册的名字自动跳过, 用于**禁止识图子代理再嵌套调用子代理** |
 | `questionDefault` | 见 schema | 未给 question 时的缺省识别指令 |
 | `normalize` | `true` | 图片大小标准化开关 |
 | `normalizeLongEdge` | `1024` | 自定义最长边上限(px, 128–8192, 步进 16): 超过才缩小(仅缩不放、保比例、自动扶正), heic/avif/bmp 等转 PNG; 无转换工具自动回退原图 |

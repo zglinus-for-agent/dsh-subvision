@@ -1,4 +1,20 @@
 import z from "@deepseek-ai/schemastery";
+/**
+ * Delegation-capable tools hidden from recognition children by default: the
+ * spawners/forkers plus the subagent-control tools (a vision child has no
+ * children of its own, and `send_message` could otherwise steer its parent).
+ * `image_recognize` is included so a vision child can never recurse.
+ */
+export const DEFAULT_DENY_CHILD_TOOLS = [
+    "subagent",
+    "subagent_fork",
+    "workflow",
+    "ralph",
+    "image_recognize",
+    "list_agents",
+    "send_message",
+    "interrupt_agent",
+];
 export const Config = z.object({
     provider: z.string().default("spawn"),
     toolName: z.string().default("image_recognize"),
@@ -7,6 +23,7 @@ export const Config = z.object({
         model: z.string().min(1),
     }).default(undefined),
     maxTokens: z.natural().min(1).max(Number.MAX_SAFE_INTEGER).step(1).default(undefined),
+    denyChildTools: z.array(z.string()).default([...DEFAULT_DENY_CHILD_TOOLS]),
     questionDefault: z.string().default("识别这张图片，尽量详细准确地描述内容（主体/物体/文字/布局/场景）；看不清或无法确认的地方如实说明。"),
     normalize: z.boolean().default(true),
     normalizeLongEdge: z.natural().min(128).max(8192).step(16).default(1024),
@@ -35,6 +52,17 @@ export function normalizeConfig(input = {}) {
     if (questionDefault.length === 0) {
         throw new Error("questionDefault must not be empty");
     }
+    const denyChildTools = [];
+    for (const name of input.denyChildTools ?? DEFAULT_DENY_CHILD_TOOLS) {
+        if (typeof name !== "string") {
+            throw new Error("denyChildTools entries must be strings");
+        }
+        const trimmed = name.trim();
+        if (trimmed.length === 0)
+            continue;
+        if (!denyChildTools.includes(trimmed))
+            denyChildTools.push(trimmed);
+    }
     return {
         provider: (input.provider ?? "spawn").trim(),
         toolName: (input.toolName ?? "image_recognize").trim(),
@@ -45,6 +73,7 @@ export function normalizeConfig(input = {}) {
             },
         }),
         ...(maxTokens === undefined ? {} : { maxTokens }),
+        denyChildTools,
         questionDefault,
         normalize: input.normalize ?? true,
         normalizeLongEdge,

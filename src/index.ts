@@ -5,7 +5,10 @@ import type {} from "@deepseek-ai/dsh-subagent";
 import type {} from "@deepseek-ai/dsh-agent";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { SessionId } from "@deepseek-ai/dsh-session";
-import { installSettingsSection, settingsNamespace } from "@deepseek-ai/dsh-settings";
+// dsh-lan 2026-09-12: dsh 0.1.5 removed the installSettingsSection /
+// settingsNamespace exports from @deepseek-ai/dsh-settings; the schema is now
+// registered through the settings service (see settings-compat.ts).
+import { installSettingsSectionCompat as installSettingsSection } from "./settings-compat.js";
 
 import { Config, normalizeConfig, type PluginConfig, type VisionModel } from "./config.js";
 import { resolveImage, hashMarker } from "./image.js";
@@ -13,6 +16,8 @@ import { standardizeImage } from "./image-std.js";
 import { ensureThumbnail } from "./thumb.js";
 import { VisionRegistry, type VisionChildRecord } from "./vision-registry.js";
 import { installDevicesApi } from "./vision-devices.js";
+import { firstVisionModel, type ProviderCatalogEntry } from "./vision-models.js";
+import { childDelegationFilter } from "./child-tools.js";
 
 export { Config, normalizeConfig } from "./config.js";
 export { VisionRegistry } from "./vision-registry.js";
@@ -21,7 +26,7 @@ export type { PluginConfig, VisionModel } from "./config.js";
 export const name = "dsh-subvision";
 export const inject = ["tools", "subagents", "agents", "llm", "webServer"];
 
-const SETTINGS_NAMESPACE = settingsNamespace("subvision");
+const SETTINGS_NAMESPACE = "subvision";
 
 /** One in-process queue per (parent session, image hash) so racing calls cannot create two children. */
 const createLocks = new Map<string, Promise<unknown>>();
@@ -77,16 +82,29 @@ export function apply(ctx: Context, config: PluginConfig): void {
     return registry;
   };
 
-  installSettingsSection(ctx, SETTINGS_NAMESPACE, Config, normalized, {
-    setSource: source => {
-      currentSource = source;
-    },
-    validate: value => {
-      normalizeConfig(value);
-    },
-    onChange: () => {
-      void currentConfig();
-    },
+  // Provider-level cache for the "auto" vision model lookup (60s TTL inside
+  // firstVisionModel), so repeated recognitions don't re-probe the catalog.
+  const autoCatalog = new Map<string, ProviderCatalogEntry>();
+
+  // Register the settings section only once the settings service is ready.
+  // The provider publishes its document just before it becomes injectable, so
+  // registering earlier froze this namespace on the composition base only: a
+  // `subvision.model` already present in settings.yaml stayed invisible
+  // (`/devices` reported defaultModel null) and the saved default was silently
+  // ignored until the next write. ssh-gate avoids this by declaring `settings`
+  // in its inject list; this plugin keeps settings optional and defers instead.
+  ctx.inject(["settings"], (settingsCtx) => {
+    installSettingsSection(settingsCtx, SETTINGS_NAMESPACE, Config, normalized, {
+      setSource: source => {
+        currentSource = source;
+      },
+      validate: value => {
+        normalizeConfig(value);
+      },
+      onChange: () => {
+        void currentConfig();
+      },
+    });
   });
 
   // 识图设备页服务端 API：/dsh-subvision/v1/{devices,models,device/recreate}
@@ -94,7 +112,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
 
   ctx.tools.register(defineTool({
     name: currentConfig().toolName,
-    description: "Identify/recognize one image with a dedicated vision subagent. Each distinct image (by content hash) owns exactly one subagent titled 识图 | <path> | <hash>; asking again about the same image continues the SAME subagent (its conversation remembers the image), including after restarts. The recognized answer arrives as a completion notice when the subagent settles. Optionally override its model per call.",
+    description: "Identify/recognize one image with a dedicated vision subagent. Each distinct image (by content hash) owns exactly one subagent titled 识图 | <path> | <hash>; asking again about the same image continues the SAME subagent (its conversation remembers the image), including after restarts. The recognized answer arrives as a completion notice when the subagent settles. The child is created without the delegation tools, so it never nests further subagents. Optionally override its model per call.",
     parameters: {
       image: {
         type: "string",
@@ -107,7 +125,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       },
       model: {
         type: "string",
-        description: 'Optional vision model override for the subagent, "provider/model" or a bare model name (keeps the current provider). Defaults to the plugin setting subvision.model, then to the supervisor model. Only applies when a new subagent is created for this image.',
+        description: 'Optional vision model override for the subagent, "provider/model" or a bare model name (keeps the current provider). Defaults to the plugin setting subvision.model; otherwise the plugin auto-selects the first vision-capable model in the catalog (auto) and only falls back to the supervisor model when no vision model is available. Only applies when a new subagent is created for this image.',
       },
     },
     output: {
@@ -155,14 +173,12 @@ export function apply(ctx: Context, config: PluginConfig): void {
       const question = (args.question ?? "").trim() || cfg.questionDefault;
       const override = parseModelOverride(args.model, parent.options?.provider);
       const configuredModel = cfg.model;
-      const provider = override.provider ?? configuredModel?.provider ?? parent.options?.provider;
-      const model = override.model ?? configuredModel?.model ?? parent.options?.model;
-      const agentOptions = {
-        ...(provider === undefined ? {} : { provider }),
-        ...(model === undefined ? {} : { model }),
-        ...(cfg.maxTokens === undefined ? {} : { maxTokens: cfg.maxTokens }),
-      };
-      const hasAgentOptions = provider !== undefined || model !== undefined || cfg.maxTokens !== undefined;
+      // Explicit per-call override wins, then the configured default model.
+      // Whatever is still unset is resolved as "auto" (first vision-capable
+      // model) below — and only when a new child is actually created, so
+      // followups pay no catalog latency.
+      let provider = override.provider ?? configuredModel?.provider;
+      let model = override.model ?? configuredModel?.model;
 
       const title = titleFor(resolved.path, marker);
       const lockKey = `${parentSessionId}\u0000${resolved.hash}`;
@@ -175,12 +191,10 @@ export function apply(ctx: Context, config: PluginConfig): void {
               text: `继续识别这张图片（${resolved.path}，哈希 ${marker}）的追问：${question}`,
             },
           ];
-          await ctx.subagents.followup(parent, SessionId(existing.childId), message, {
-            source: {
-              kind: "coordinator",
-              form: "relay",
-              senderSessionId: parent.id,
-            },
+          // dsh-lan 2026-09-12: 0.1.5 replaced `subagents.followup(...)` with
+          // `subagents.sendMessage(sender, targetId, content, { signal })`; the
+          // service now derives durable sender attribution itself.
+          await ctx.subagents.sendMessage(parent, SessionId(existing.childId), message, {
             signal: exec.signal,
           });
           existing.lastUsedAt = Date.now();
@@ -201,18 +215,59 @@ export function apply(ctx: Context, config: PluginConfig): void {
               + `问题：${question}`,
           },
         ];
+        // "Auto" (the default when neither the per-call override nor the
+        // subvision.model setting is set): take the first vision-capable model
+        // from the llm catalog, so a recognition child never inherits a
+        // text-only supervisor model such as deepseek-v4-flash. Falls back to
+        // the supervisor's own model when the catalog exposes no vision model.
+        if (provider === undefined || model === undefined) {
+          const auto = await firstVisionModel(ctx, autoCatalog);
+          if (auto !== undefined) {
+            provider ??= auto.provider;
+            model ??= auto.model;
+            ctx.logger?.info?.("[dsh-subvision] auto vision model: %s/%s", auto.provider, auto.model);
+          }
+          provider ??= parent.options?.provider;
+          model ??= parent.options?.model;
+        }
+        const agentOptions = {
+          ...(provider === undefined ? {} : { provider }),
+          ...(model === undefined ? {} : { model }),
+          ...(cfg.maxTokens === undefined ? {} : { maxTokens: cfg.maxTokens }),
+        };
+        const hasAgentOptions = provider !== undefined || model !== undefined || cfg.maxTokens !== undefined;
+        // Keep recognition a flat, single delegation: the child never gets the
+        // tools that could spawn/steer further subagents (no nested children in
+        // the calling conversation, no image_recognize recursion).
+        const toolFilter = childDelegationFilter(ctx, cfg.denyChildTools);
         const request: Record<string, unknown> = {
           label: title,
           prompt,
           parent,
+          ...(toolFilter === undefined ? {} : { toolFilter }),
         };
         if (hasAgentOptions) request.agentOptions = agentOptions;
-        const start = await ctx.subagents.startContinuable({
+        const spec = {
           provider: cfg.provider,
           label: title,
           request: request as Parameters<typeof ctx.subagents.startContinuable>[0]["request"],
           signal: exec.signal,
-        });
+        };
+        let start: Awaited<ReturnType<typeof ctx.subagents.startContinuable>>;
+        try {
+          start = await ctx.subagents.startContinuable(spec);
+        } catch (error) {
+          // A toolFilter naming a tool this provider cannot restrict is rejected
+          // at start. Recognition must still work, so retry once without the
+          // guard and warn loudly rather than failing the whole call.
+          if (toolFilter === undefined) throw error;
+          ctx.logger?.warn?.(
+            "[dsh-subvision] child tool filter rejected (%s); starting without the nested-delegation guard",
+            String((error as Error)?.message ?? error),
+          );
+          delete (spec.request as { toolFilter?: unknown }).toolFilter;
+          start = await ctx.subagents.startContinuable(spec);
+        }
         const childId = String(start.childId);
         await registry.remember({
           childId,
@@ -227,7 +282,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       });
       const result = await run;
       const note = result.action === "created"
-        ? `已为该图片（哈希 ${marker}）创建专属识别子代理 ${result.childId}（标题：${title}），识别结果完成后会以通知送达。之后对同一图片再次调用本工具即继续同一子代理。`
+        ? `已为该图片（哈希 ${marker}）创建专属识别子代理 ${result.childId}（标题：${title}），识别结果完成后会以通知送达。之后对同一图片再次调用本工具即继续同一子代理。该子代理已禁用再委派类工具（不会再嵌套调用子代理）。`
         : `追问已送达该图片（哈希 ${marker}）的同一识别子代理 ${result.childId}，其回答完成后会以通知送达。`;
       return {
         action: result.action,

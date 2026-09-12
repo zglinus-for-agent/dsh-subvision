@@ -1,7 +1,7 @@
 {
   "name": "dsh-subvision",
-  "version": "0.2.1",
-  "description": "DSH 图片识别插件: 每张图片一个可追问的 vision subagent(标题「识图 | <路径> | <sha256前16>」), 重启后可续问同一子代理; 图片大小标准化(用户可自定义); Settings 独立「图片代理」页管理每图子代理并可指定/重建模型。",
+  "version": "0.3.0",
+  "description": "DSH 图片识别插件: 每张图片一个可追问的 vision subagent(标题「识图 | <路径> | <sha256前16>」), 重启后可续问同一子代理; 识别模型默认「自动」= 取目录里第一个可读图的视觉模型(也可显式指定或按图重建); 识图子代理禁用再委派工具, 不会嵌套调用子代理; 图片大小标准化(用户可自定义); Settings 独立「图片代理」页管理每图子代理。",
   "license": "GPL-3.0",
   "type": "module",
   "main": "./dist/index.js",
